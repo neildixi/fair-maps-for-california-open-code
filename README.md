@@ -51,7 +51,7 @@ A Python-based redistricting analysis tool that generates and evaluates redistri
    ```
 
 ## Configuration
-
+### You need to download "california_merged_data.geojson," which is available on our website. Visit fairmapsforcalifornia.com/
 ### City Configuration
 - `CITY_NAME`: Name of your city (used for output filenames)
 - `INPUT_GEOJSON_FILE`: Path to your city's GeoJSON data file
