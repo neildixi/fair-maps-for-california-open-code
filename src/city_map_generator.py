@@ -1,6 +1,13 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+# Ensure fairmaps is importable (when run without pip install -e .)
+import sys
+import os
+_src = os.path.dirname(os.path.abspath(__file__))
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+
 import pandas as pd
 import geopandas as gpd
 import numpy as np
@@ -15,13 +22,24 @@ import os
 import time
 
 # =============================================================================
-# CONFIGURATION VARIABLES - MODIFY THESE FOR YOUR CITY
+# CONFIGURATION - EASILY SWITCH BETWEEN ANY CITY OR COUNTY IN CALIFORNIA
+# =============================================================================
+#
+# Set JURISDICTION_NAME to match what you used in extract_city_data.py.
+# Paths are derived automatically: {jurisdiction}_outputs/{jurisdiction}_merged_data.geojson
+# See docs/CALIFORNIA_JURISDICTIONS.md for PLACE20/COUNTY20 codes.
+#
 # =============================================================================
 
-# City configuration
-CITY_NAME = "Santa Clara"  # Name of your city (used for output filenames)
-INPUT_GEOJSON_FILE = CITY_NAME.lower().replace(" ", "_") + "_outputs/" + CITY_NAME.lower().replace(" ", "_") + "_merged_data.geojson"  # City-specific GeoJSON file
-NUM_DISTRICTS = 6  # Number of districts to create
+# Jurisdiction name (must match extract_city_data.py JURISDICTION_NAME)
+# Examples: "Palo Alto", "San Jose", "San Mateo County", "Santa Clara County"
+JURISDICTION_NAME = "Palo Alto"
+
+# Override input file path (None = auto: {jurisdiction}_outputs/{jurisdiction}_merged_data.geojson)
+INPUT_GEOJSON_FILE = None  # e.g. "palo_alto_outputs/palo_alto_merged_data.geojson"
+
+# Number of districts to create (cities often 4-7; counties vary by population)
+NUM_DISTRICTS = 6
 
 # Ensemble configuration
 # Default values - will be updated by user input
@@ -29,8 +47,13 @@ TEST_ENSEMBLE_SIZE = 100  # Size of test ensemble to generate statistics
 MAIN_ENSEMBLE_SIZE = 1000  # Size of main ensemble for final analysis
 TOP_N_PLANS = 100  # Number of top plans to save block assignment CSVs for
 
-# File paths
-OUTPUT_DIRECTORY = CITY_NAME.lower().replace(" ", "_") + "_outputs"  # Directory for all outputs
+# File paths (auto-derived from JURISDICTION_NAME)
+def _jurisdiction_slug(name):
+    return name.lower().replace(" ", "_").replace(",", "")
+_slug = _jurisdiction_slug(JURISDICTION_NAME)
+OUTPUT_DIRECTORY = _slug + "_outputs"
+if INPUT_GEOJSON_FILE is None:
+    INPUT_GEOJSON_FILE = os.path.join(OUTPUT_DIRECTORY, _slug + "_merged_data.geojson")
 TEST_STATS_FILE = "test_ensemble_stats.json"  # File to save test ensemble statistics
 
 # Processing settings
@@ -46,19 +69,47 @@ HISPANIC_POPULATION_COLUMN = "Hispanic Origin"  # Column name for Hispanic popul
 GEOID_COLUMN = "GEOID20"  # Column name for geographic ID
 
 # Metric configuration (modify if you want different metrics or weights)
+# All metrics from fairmaps compute_all_metrics
 METRIC_ORDER = [
+    # Compactness (higher = better)
     "avg_polsby_popper",
-    "white_hispanic_dissimilarity", 
+    "avg_schwartzberg",
+    "avg_reock",
+    "avg_convex_hull",
+    "avg_boundary_node_ratio",
+    # Demographics - evenness (lower = better)
+    "white_hispanic_dissimilarity",
     "white_asian_dissimilarity",
-    "hispanic_separation",
-    "asian_separation", 
+    "hispanic_gini",
+    "asian_gini",
+    "entropy_index",
+    "hispanic_atkinson",
+    "asian_atkinson",
+    # Demographics - exposure (isolation lower, interaction higher)
     "hispanic_isolation",
-    "asian_isolation"
+    "asian_isolation",
+    "hispanic_interaction",
+    "asian_interaction",
+    # Demographics - concentration (lower = better)
+    "hispanic_delta",
+    "asian_delta",
 ]
+NUM_METRICS = len(METRIC_ORDER)
 
 # Weights for scoring (must sum to 1.0)
-# Current weights: 2/7 for compactness, rest distributed among demographic metrics
-METRIC_WEIGHTS = [2/7, 25/98, 25/98, 5/98, 5/98, 5/98, 5/98]
+# Default: all metrics equal weight
+METRIC_WEIGHTS = [1 / NUM_METRICS] * NUM_METRICS
+
+# FairMaps aggregation: use empirical CDF (discrete) and configurable power mean
+USE_FAIRMAPS = True           # Use fairmaps metrics + empirical percentile + power mean
+POWER_MEAN_LAMBDA = 0.0       # 0=GM, 1=AM, -1=HM, -inf=min
+
+# Communities of Interest (COI): graph contraction
+# Each COI is a list of block GEOIDs (GEOID20) that will be merged into one "super-node"
+# with population = sum of block populations and adjacency = boundary of the COI.
+# Leave empty [] to disable COI contraction.
+# Example: COI_LIST = [ ["060855113024003", "060855113024004"], ["060855110002001"] ]
+COI_LIST = []
 
 # =============================================================================
 # END CONFIGURATION - DO NOT MODIFY BELOW THIS LINE
@@ -76,10 +127,10 @@ def load_test_ensemble_stats():
         import json
         with open(stats_path, 'r') as f:
             metric_stats = json.load(f)
-        print(f"✓ Loaded test ensemble statistics from {stats_path}")
+        print(f"[OK] Loaded test ensemble statistics from {stats_path}")
         return True
     else:
-        print(f"✗ Test ensemble statistics not found at {stats_path}")
+        print(f"[!] Test ensemble statistics not found at {stats_path}")
         print("Please run the test ensemble first to generate statistics.")
         metric_stats = None
         return False
@@ -92,7 +143,133 @@ def save_test_ensemble_stats(stats):
     import json
     with open(stats_path, 'w') as f:
         json.dump(stats, f, indent=2)
-    print(f"✓ Saved test ensemble statistics to {stats_path}")
+    print(f"[OK] Saved test ensemble statistics to {stats_path}")
+
+
+def contract_graph_for_cois(graph, coi_list, geoid_to_node):
+    """
+    Contract each COI (list of GEOIDs) into a single super-node:
+    - Population and demographics = sum over blocks in the COI.
+    - Adjacency = boundary: super-node is adjacent to any block outside the COI
+      that was adjacent to any block inside the COI.
+    - Geometry = unary_union of block geometries (for compactness metrics).
+
+    Returns:
+        graph_contracted: Graph with COI nodes merged into super-nodes.
+        contraction_map: dict original_node_id -> contracted_node_id (original or ("coi", i)).
+        original_nodes_for_export: list of (original_node_id, geoid) for every block (for CSV export).
+    """
+    from shapely.ops import unary_union
+
+    # Columns to sum for super-nodes
+    sum_columns = [
+        POPULATION_COLUMN,
+        WHITE_POPULATION_COLUMN,
+        BLACK_POPULATION_COLUMN,
+        ASIAN_POPULATION_COLUMN,
+        HISPANIC_POPULATION_COLUMN,
+    ]
+    # Copy any other numeric/attribute columns from first node (except geometry)
+    sample_node = next(iter(graph.nodes))
+    all_attr = list(graph.nodes[sample_node].keys()) if graph.nodes else []
+    for col in all_attr:
+        if col not in sum_columns and col != "geometry" and col != GEOID_COLUMN:
+            try:
+                _ = sum(graph.nodes[n].get(col, 0) for n in list(graph.nodes)[:2])
+                sum_columns.append(col)
+            except (TypeError, ValueError):
+                pass
+
+    # Resolve COI lists of GEOIDs -> sets of node ids; skip missing GEOIDs
+    coi_node_sets = []
+    for i, geoid_list in enumerate(coi_list):
+        nodes_in_coi = set()
+        for g in geoid_list:
+            if g in geoid_to_node:
+                nodes_in_coi.add(geoid_to_node[g])
+            else:
+                print(f"[!] COI {i}: GEOID {g} not found in graph, skipping")
+        if nodes_in_coi:
+            coi_node_sets.append(nodes_in_coi)
+        else:
+            print(f"[!] COI {i}: no valid nodes, skipping")
+
+    if not coi_node_sets:
+        # No valid COIs; return identity contraction
+        contraction_map = {n: n for n in graph.nodes}
+        original_nodes_for_export = [
+            (n, graph.nodes[n].get(GEOID_COLUMN, n)) for n in graph.nodes
+        ]
+        return graph, contraction_map, original_nodes_for_export
+
+    # Map: original node -> coi index (None if not in any COI)
+    node_to_coi = {}
+    for n in graph.nodes:
+        node_to_coi[n] = None
+    for i, node_set in enumerate(coi_node_sets):
+        for n in node_set:
+            if node_to_coi[n] is not None:
+                print(f"[!] Node {n} appears in multiple COIs; assigning to first only")
+            else:
+                node_to_coi[n] = i
+
+    # Build contracted graph (gerrychain Graph is a networkx-based graph)
+    graph_contracted = Graph()
+    # Add non-COI nodes with same attributes
+    for n in graph.nodes:
+        if node_to_coi[n] is not None:
+            continue
+        attrs = dict(graph.nodes[n])
+        graph_contracted.add_node(n, **attrs)
+
+    # Add super-nodes for each COI
+    for i, node_set in enumerate(coi_node_sets):
+        coi_id = ("coi", i)
+        attrs = {}
+        for col in sum_columns:
+            if col in graph.nodes[sample_node]:
+                attrs[col] = sum(
+                    graph.nodes[n].get(col, 0) or 0 for n in node_set
+                )
+            else:
+                attrs[col] = 0
+        attrs[GEOID_COLUMN] = f"COI_{i}"
+        # Geometry = union of all block geometries in this COI
+        geoms = [
+            graph.nodes[n]["geometry"]
+            for n in node_set
+            if "geometry" in graph.nodes[n] and graph.nodes[n]["geometry"] is not None
+        ]
+        if geoms:
+            attrs["geometry"] = unary_union(geoms)
+        else:
+            attrs["geometry"] = None
+        graph_contracted.add_node(coi_id, **attrs)
+
+    # Edges: (u, v) in original -> add (contracted(u), contracted(v)) if different
+    def contract(n):
+        return n if node_to_coi[n] is None else ("coi", node_to_coi[n])
+
+    seen_edges = set()
+    for u, v in graph.edges:
+        cu, cv = contract(u), contract(v)
+        if cu == cv:
+            continue
+        key = frozenset([cu, cv])
+        if key not in seen_edges:
+            seen_edges.add(key)
+            graph_contracted.add_edge(cu, cv)
+
+    contraction_map = {n: contract(n) for n in graph.nodes}
+    original_nodes_for_export = [
+        (n, graph.nodes[n].get(GEOID_COLUMN, n)) for n in graph.nodes
+    ]
+
+    print(f"[OK] COI contraction: {len(coi_node_sets)} COI(s), "
+          f"{len(graph.nodes)} -> {len(graph_contracted.nodes)} nodes, "
+          f"{len(graph.edges)} -> {len(graph_contracted.edges)} edges")
+    return graph_contracted, contraction_map, original_nodes_for_export
+
 
 def generate_test_ensemble_stats(graph, num_districts, test_ensemble_size=None):
     """Generate test ensemble and calculate metric statistics."""
@@ -126,23 +303,35 @@ def generate_test_ensemble_stats(graph, num_districts, test_ensemble_size=None):
     df_test = pd.DataFrame(test_plans)
     stats = {}
     
-    for metric in METRIC_ORDER:
-        if metric in df_test.columns:
-            values = df_test[metric].dropna()
-            if len(values) > 0:
-                stats[metric] = {
-                    "mean": float(values.mean()),
-                    "std": float(values.std()),
-                    "min": float(values.min()),
-                    "max": float(values.max()),
-                    "count": int(len(values))
-                }
+    if USE_FAIRMAPS:
+        from fairmaps.aggregation import build_empirical_cdf
+        for metric in METRIC_ORDER:
+            if metric in df_test.columns:
+                values = df_test[metric].dropna().values
+                if len(values) > 0:
+                    sorted_vals = build_empirical_cdf(values)
+                    stats[metric] = {"sorted_values": sorted_vals.tolist()}
+                else:
+                    stats[metric] = {"sorted_values": [0.0]}
             else:
-                print(f"Warning: No valid data for metric {metric}")
+                print(f"Warning: Metric {metric} not found in test ensemble data")
+                stats[metric] = {"sorted_values": [0.0]}
+    else:
+        for metric in METRIC_ORDER:
+            if metric in df_test.columns:
+                values = df_test[metric].dropna()
+                if len(values) > 0:
+                    stats[metric] = {
+                        "mean": float(values.mean()),
+                        "std": float(values.std()),
+                        "min": float(values.min()),
+                        "max": float(values.max()),
+                        "count": int(len(values))
+                    }
+                else:
+                    stats[metric] = {"mean": 0.0, "std": 1.0, "min": 0.0, "max": 1.0, "count": 0}
+            else:
                 stats[metric] = {"mean": 0.0, "std": 1.0, "min": 0.0, "max": 1.0, "count": 0}
-        else:
-            print(f"Warning: Metric {metric} not found in test ensemble data")
-            stats[metric] = {"mean": 0.0, "std": 1.0, "min": 0.0, "max": 1.0, "count": 0}
     
     # Save statistics
     save_test_ensemble_stats(stats)
@@ -153,41 +342,89 @@ def generate_test_ensemble_stats(graph, num_districts, test_ensemble_size=None):
     print(f"{'='*60}")
     for metric, stat in stats.items():
         print(f"{metric}:")
-        print(f"  Mean: {stat['mean']:.6f}")
-        print(f"  Std:  {stat['std']:.6f}")
-        print(f"  Range: [{stat['min']:.6f}, {stat['max']:.6f}]")
-        print(f"  Count: {stat['count']}")
+        if "sorted_values" in stat:
+            sv = np.array(stat["sorted_values"])
+            print(f"  Count: {len(sv)}, Range: [{sv.min():.6f}, {sv.max():.6f}]")
+        else:
+            print(f"  Mean: {stat['mean']:.6f}")
+            print(f"  Std:  {stat['std']:.6f}")
+            print(f"  Range: [{stat['min']:.6f}, {stat['max']:.6f}]")
+            print(f"  Count: {stat['count']}")
         print()
     
     return stats
+
+# Compactness metrics: higher is better. Demographics: lower is better.
+HIGHER_IS_BETTER = ["avg_polsby_popper", "avg_schwartzberg", "avg_reock", "avg_convex_hull", "avg_boundary_node_ratio", "hispanic_interaction", "asian_interaction"]
+
 
 def plan_score_array(row):
     if metric_stats is None:
         raise ValueError("metric_stats is None. Please ensure test ensemble statistics are loaded.")
     
+    if USE_FAIRMAPS:
+        from fairmaps.aggregation import percentile_from_empirical_cdf
+        arr = []
+        for i, metric in enumerate(METRIC_ORDER):
+            if metric not in row or pd.isna(row[metric]):
+                arr.append(0.5)
+                continue
+            value = row[metric]
+            stat = metric_stats.get(metric, {})
+            sorted_vals = stat.get("sorted_values")
+            if sorted_vals is not None and len(sorted_vals) > 0:
+                sv = np.array(sorted_vals)
+                percentile = percentile_from_empirical_cdf(float(value), sv)
+                if metric not in HIGHER_IS_BETTER:
+                    percentile = 1.0 - percentile  # lower raw value -> better -> higher percentile
+            else:
+                # Fallback: parametric (old stats format)
+                mean = stat.get("mean", 0.5)
+                std = stat.get("std", 1.0)
+                if std == 0:
+                    percentile = 0.5
+                else:
+                    z = (float(value) - mean) / std
+                    percentile = norm.cdf(z) if metric in HIGHER_IS_BETTER else 1 - norm.cdf(z)
+            arr.append(float(np.clip(percentile, 0, 1)))
+        return np.array(arr)
+    
+    # Legacy: parametric (normal) approximation
     arr = []
     for i, metric in enumerate(METRIC_ORDER):
         mean = metric_stats[metric]["mean"]
         std = metric_stats[metric]["std"]
         value = row[metric]
         if std == 0:
-            percentile = 0.5  # fallback if no variation
+            percentile = 0.5
         else:
             z = (value - mean) / std
-            if i == 0:  # polsby_popper, higher is better
+            if metric in HIGHER_IS_BETTER or i == 0:
                 percentile = norm.cdf(z)
-            else:       # others, lower is better
+            else:
                 percentile = 1 - norm.cdf(z)
         arr.append(np.clip(percentile, 0, 1))
-    return arr
+    return np.array(arr)
 
-def weighted_geom_mean(arr):
+
+def weighted_aggregate(arr, lam=None):
+    """Power mean aggregation. lam=0 is geometric mean."""
+    if lam is None:
+        lam = POWER_MEAN_LAMBDA
+    if USE_FAIRMAPS:
+        from fairmaps.aggregation import power_mean
+        return power_mean(np.array(arr), np.array(METRIC_WEIGHTS), lam)
+    # Legacy geometric mean
     arr = np.array(arr)
     result = 1.0
     for i, weight in enumerate(METRIC_WEIGHTS):
         if i < len(arr):
             result *= arr[i] ** weight
     return result
+
+
+def weighted_geom_mean(arr):
+    return weighted_aggregate(arr, lam=0.0)
 
 def calculate_demographic_metrics(partition):
     metrics = {}
@@ -380,7 +617,7 @@ def generate_plan_without_scoring(graph, num_districts, index):
                 comp_pop = sum(graph.nodes[node][POPULATION_COLUMN] for node in comp)
                 print(f"  Component {i+1}: {len(comp)} nodes, {comp_pop} population")
         else:
-            print("Graph is connected ✓")
+            print("Graph is connected [OK]")
 
     try:
         # Suppress the BipartitionWarning
@@ -441,29 +678,46 @@ def generate_plan_without_scoring(graph, num_districts, index):
 
     # Calculate metrics for this plan
     t6 = time.time()
-    metrics = calculate_demographic_metrics(partition)
+    if USE_FAIRMAPS:
+        from fairmaps.compute import compute_all_metrics
+        group_cols = {
+            "white": WHITE_POPULATION_COLUMN,
+            "black": BLACK_POPULATION_COLUMN,
+            "asian": ASIAN_POPULATION_COLUMN,
+            "hispanic": HISPANIC_POPULATION_COLUMN,
+        }
+        metrics = compute_all_metrics(partition, pop_col=POPULATION_COLUMN, group_cols=group_cols)
+        total_pop = sum(partition.graph.nodes[n][POPULATION_COLUMN] for n in partition.graph.nodes)
+        plan_data = {
+            'plan_number': index + 1,
+            'num_districts': num_districts,
+            'total_population': total_pop,
+        }
+        plan_data.update(metrics)
+        if 'hispanic_interaction' not in plan_data:
+            plan_data['hispanic_interaction'] = plan_data.get('hispanic_separation', 0)
+        if 'asian_interaction' not in plan_data:
+            plan_data['asian_interaction'] = plan_data.get('asian_separation', 0)
+    else:
+        metrics = calculate_demographic_metrics(partition)
+        polsby_scores = calculate_polsby_popper_scores(partition)
+        plan_data = {
+            'plan_number': index + 1,
+            'num_districts': num_districts,
+            'total_population': sum(metrics[f'district_{d}_total_pop'] for d in range(num_districts)),
+            'avg_polsby_popper': np.mean(polsby_scores) if polsby_scores else 0,
+            'min_polsby_popper': np.min(polsby_scores) if polsby_scores else 0,
+            'max_polsby_popper': np.max(polsby_scores) if polsby_scores else 0
+        }
+        plan_data.update(metrics)
+        plan_data['hispanic_interaction'] = plan_data.get('hispanic_separation', plan_data.get('hispanic_interaction', 0))
+        plan_data['asian_interaction'] = plan_data.get('asian_separation', plan_data.get('asian_interaction', 0))
     t7 = time.time()
-    timings['calculate_demographic_metrics'] = t7 - t6
-
-    # Calculate Polsby-Popper scores
-    t8 = time.time()
-    polsby_scores = calculate_polsby_popper_scores(partition)
-    t9 = time.time()
-    timings['calculate_polsby_popper'] = t9 - t8
-
-    plan_data = {
-        'plan_number': index + 1,
-        'num_districts': num_districts,
-        'total_population': sum(metrics[f'district_{d}_total_pop'] for d in range(num_districts)),
-        'avg_polsby_popper': np.mean(polsby_scores) if polsby_scores else 0,
-        'min_polsby_popper': np.min(polsby_scores) if polsby_scores else 0,
-        'max_polsby_popper': np.max(polsby_scores) if polsby_scores else 0
-    }
-    plan_data.update(metrics)
+    timings['calculate_metrics'] = t7 - t6
     
     return plan_data
 
-def generate_and_save_plan(graph, num_districts, index, timing_log):
+def generate_and_save_plan(graph, num_districts, index, timing_log, contraction_map=None, original_nodes_for_export=None):
     timings = {}
     t0 = time.time()
     total_population = sum(graph.nodes[node][POPULATION_COLUMN] for node in graph.nodes)
@@ -528,12 +782,18 @@ def generate_and_save_plan(graph, num_districts, index, timing_log):
     except Exception as e:
         return None
 
-    # Save block assignments
+    # Save block assignments (expand COI super-nodes back to original blocks when applicable)
     block_assignments = []
-    for node in partition.graph.nodes:
-        geoid = partition.graph.nodes[node].get(GEOID_COLUMN, node)
-        district = partition.assignment[node] + 1  # 1-based
-        block_assignments.append({'GEOID20': geoid, 'District': district})
+    if contraction_map is not None and original_nodes_for_export is not None:
+        for node_id, geoid in original_nodes_for_export:
+            contracted = contraction_map[node_id]
+            district = partition.assignment[contracted] + 1  # 1-based
+            block_assignments.append({'GEOID20': geoid, 'District': district})
+    else:
+        for node in partition.graph.nodes:
+            geoid = partition.graph.nodes[node].get(GEOID_COLUMN, node)
+            district = partition.assignment[node] + 1  # 1-based
+            block_assignments.append({'GEOID20': geoid, 'District': district})
     assignment_df = pd.DataFrame(block_assignments)
     assignment_df.to_csv(f"{OUTPUT_DIRECTORY}/plan_{index+1}_block_assignment.csv", index=False)
     t5 = time.time()
@@ -541,33 +801,46 @@ def generate_and_save_plan(graph, num_districts, index, timing_log):
 
     # Calculate metrics for this plan
     t6 = time.time()
-    metrics = calculate_demographic_metrics(partition)
+    if USE_FAIRMAPS:
+        from fairmaps.compute import compute_all_metrics
+        group_cols = {
+            "white": WHITE_POPULATION_COLUMN,
+            "black": BLACK_POPULATION_COLUMN,
+            "asian": ASIAN_POPULATION_COLUMN,
+            "hispanic": HISPANIC_POPULATION_COLUMN,
+        }
+        metrics = compute_all_metrics(partition, pop_col=POPULATION_COLUMN, group_cols=group_cols)
+        total_pop = sum(partition.graph.nodes[n][POPULATION_COLUMN] for n in partition.graph.nodes)
+        plan_data = {
+            'plan_number': index + 1,
+            'num_districts': num_districts,
+            'total_population': total_pop,
+        }
+        plan_data.update(metrics)
+    else:
+        metrics = calculate_demographic_metrics(partition)
+        polsby_scores = calculate_polsby_popper_scores(partition)
+        plan_data = {
+            'plan_number': index + 1,
+            'num_districts': num_districts,
+            'total_population': sum(metrics[f'district_{d}_total_pop'] for d in range(num_districts)),
+            'avg_polsby_popper': np.mean(polsby_scores) if polsby_scores else 0,
+            'min_polsby_popper': np.min(polsby_scores) if polsby_scores else 0,
+            'max_polsby_popper': np.max(polsby_scores) if polsby_scores else 0
+        }
+        plan_data.update(metrics)
+        plan_data['hispanic_interaction'] = plan_data.get('hispanic_separation', plan_data.get('hispanic_interaction', 0))
+        plan_data['asian_interaction'] = plan_data.get('asian_separation', plan_data.get('asian_interaction', 0))
     t7 = time.time()
-    timings['calculate_demographic_metrics'] = t7 - t6
-
-    # Calculate Polsby-Popper scores
-    t8 = time.time()
-    polsby_scores = calculate_polsby_popper_scores(partition)
-    t9 = time.time()
-    timings['calculate_polsby_popper'] = t9 - t8
-
-    plan_data = {
-        'plan_number': index + 1,
-        'num_districts': num_districts,
-        'total_population': sum(metrics[f'district_{d}_total_pop'] for d in range(num_districts)),
-        'avg_polsby_popper': np.mean(polsby_scores) if polsby_scores else 0,
-        'min_polsby_popper': np.min(polsby_scores) if polsby_scores else 0,
-        'max_polsby_popper': np.max(polsby_scores) if polsby_scores else 0
-    }
-    plan_data.update(metrics)
+    timings['calculate_metrics'] = t7 - t6
     
-    # Calculate plan score
+    # Calculate plan score (percentiles -> power mean aggregate)
     t10 = time.time()
-    plan_score = plan_score_array(plan_data)
+    score_arr = plan_score_array(plan_data)
+    plan_data['plan_score'] = weighted_aggregate(score_arr, POWER_MEAN_LAMBDA)
+    plan_data['score_array'] = score_arr
     t11 = time.time()
     timings['calculate_plan_score'] = t11 - t10
-    
-    plan_data['plan_score'] = plan_score
     
     # Log timing information
     timing_log.append({
@@ -579,7 +852,7 @@ def generate_and_save_plan(graph, num_districts, index, timing_log):
 
 def main():
     print(f"{'='*60}")
-    print(f"REDISTRICTING ANALYSIS FOR {CITY_NAME.upper()}")
+    print(f"REDISTRICTING ANALYSIS FOR {JURISDICTION_NAME.upper()}")
     print(f"{'='*60}")
     
     # Create output directory
@@ -615,6 +888,19 @@ def main():
         print(f"Using largest component with {len(largest_component)} nodes")
         graph = graph.subgraph(largest_component).copy()
         print(f"Final graph has {len(graph.nodes)} nodes and {len(graph.edges)} edges")
+
+    # Optional: contract COIs into super-nodes (population sum, boundary adjacency)
+    contraction_map = None
+    original_nodes_for_export = None
+    if COI_LIST:
+        geoid_to_node = {
+            graph.nodes[n].get(GEOID_COLUMN): n
+            for n in graph.nodes
+            if graph.nodes[n].get(GEOID_COLUMN) is not None
+        }
+        graph, contraction_map, original_nodes_for_export = contract_graph_for_cois(
+            graph, COI_LIST, geoid_to_node
+        )
     
     # Check if test ensemble statistics exist
     if not load_test_ensemble_stats():
@@ -648,7 +934,11 @@ def main():
     print(f"{'='*60}")
     
     for i in range(ensemble_size):
-        plan_data = generate_and_save_plan(graph, NUM_DISTRICTS, i, timing_log)
+        plan_data = generate_and_save_plan(
+            graph, NUM_DISTRICTS, i, timing_log,
+            contraction_map=contraction_map,
+            original_nodes_for_export=original_nodes_for_export,
+        )
         
         # Skip if plan generation failed
         if plan_data is None:
@@ -689,24 +979,16 @@ def main():
 
     # Save all plans to CSV
     df_plans = pd.DataFrame(plans)
-    df_plans.to_csv(f"{OUTPUT_DIRECTORY}/{CITY_NAME.lower().replace(' ', '_')}_redistricting_plans.csv", index=False)
+    df_plans.to_csv(f"{OUTPUT_DIRECTORY}/{_slug}_redistricting_plans.csv", index=False)
 
     # Save timing log to CSV
     timing_df = pd.DataFrame(timing_log)
     timing_df.to_csv(f"{OUTPUT_DIRECTORY}/timing_log.csv", index=False)
 
     # Compute and save summary statistics
-    metrics = {
-        "avg_polsby_popper": df_plans["avg_polsby_popper"],
-        "white_hispanic_dissimilarity": df_plans["white_hispanic_dissimilarity"],
-        "white_asian_dissimilarity": df_plans["white_asian_dissimilarity"],
-        "hispanic_separation": df_plans["hispanic_separation"],
-        "asian_separation": df_plans["asian_separation"],
-        "hispanic_isolation": df_plans["hispanic_isolation"],
-        "asian_isolation": df_plans["asian_isolation"],
-    }
-    with open(f"{OUTPUT_DIRECTORY}/{CITY_NAME.lower().replace(' ', '_')}_summary.txt", "w") as f:
-        f.write(f"{CITY_NAME.upper()} REDISTRICTING ANALYSIS SUMMARY\n")
+    metrics = {m: df_plans[m] for m in METRIC_ORDER if m in df_plans.columns}
+    with open(f"{OUTPUT_DIRECTORY}/{_slug}_summary.txt", "w") as f:
+        f.write(f"{JURISDICTION_NAME.upper()} REDISTRICTING ANALYSIS SUMMARY\n")
         f.write("="*60 + "\n\n")
         f.write(f"total_plans: {len(df_plans)}\n\n")
         for metric_name, values in metrics.items():

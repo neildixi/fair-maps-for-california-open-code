@@ -1,0 +1,14 @@
+README.md
+pyproject.toml
+src/fairmaps/__init__.py
+src/fairmaps/aggregation.py
+src/fairmaps/compute.py
+src/fairmaps.egg-info/PKG-INFO
+src/fairmaps.egg-info/SOURCES.txt
+src/fairmaps.egg-info/dependency_links.txt
+src/fairmaps.egg-info/requires.txt
+src/fairmaps.egg-info/top_level.txt
+src/fairmaps/metrics/__init__.py
+src/fairmaps/metrics/compactness.py
+src/fairmaps/metrics/demographic.py
+tests/test_metrics.py
