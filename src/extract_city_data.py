@@ -22,8 +22,9 @@ JURISDICTION_CODE = 55282  # e.g. 55282 for Palo Alto (city), or 081 for San Mat
 # Display name for outputs (used in filenames and directory)
 JURISDICTION_NAME = "Palo Alto"  # e.g. "Palo Alto", "San Mateo County"
 
-# File paths - use absolute path or path relative to project root
-INPUT_DATA_FILE = r"C:\Users\neild\OneDrive\Desktop\california_merged_data.geojson"
+# File paths - use path relative to project root or absolute path
+# Download california_merged_data.geojson from fairmapsforcalifornia.com
+INPUT_DATA_FILE = "california_merged_data.geojson"
 OUTPUT_DIRECTORY = None  # None = auto: {jurisdiction_name}_outputs
 
 # Processing settings

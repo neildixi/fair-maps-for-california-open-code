@@ -223,6 +223,16 @@ def run_metrics_test():
     print("=" * 60)
 
 
+def test_unit_metrics():
+    """Pytest: metrics with mock partition (no gerrychain/geopandas)."""
+    run_unit_test_mock()
+
+
+def test_full_metrics():
+    """Pytest: full pipeline with synthetic grid and gerrychain."""
+    run_metrics_test()
+
+
 if __name__ == "__main__":
     unit_only = "--unit-only" in sys.argv
     if unit_only:
