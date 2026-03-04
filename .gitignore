@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# User-generated outputs (jurisdiction-specific)
+*_outputs/
+palo_alto_outputs/
+santa_clara_outputs/
+
+# Large data files (users download separately)
+*.geojson
+california_merged_data.geojson
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Test / debug
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/

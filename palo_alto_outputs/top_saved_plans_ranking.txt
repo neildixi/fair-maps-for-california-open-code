@@ -1,2 +1,0 @@
-#1: Plan 19 (file: plan_2_block_assignment.csv) score: 0.7335
-#2: Plan 7 (file: plan_1_block_assignment.csv) score: 0.6711
